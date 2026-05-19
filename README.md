@@ -23,10 +23,12 @@ Replace `YOUR_DEVICE_SERIAL` with the serial shown by `adb devices`. Place it on
 
 **3) Wine** — `wine` must be on your `PATH`.
 
-**4) `hzdb.exe`** — the official Meta Quest CLI binary (Windows build, runs under Wine):
+**4) `hzdb.exe`** — the official Meta Quest CLI binary (Windows build, runs under Wine). Downloaded automatically by `make install`.
+
+## Installation
 
 ```sh
-url=$(npm view @meta-quest/hzdb-win32-x64 dist.tarball)
-curl -sL "$url" | tar xz --strip-components=2 package/bin/hzdb.exe
-mv hzdb.exe ~/bin/hzdb.exe
+make install   # downloads hzdb.exe, copies hzdb and hzdb.exe to ~/bin/, installs the Linux command reference as a Claude Code skill
+make download  # download hzdb.exe only
+make clean     # removes hzdb.exe from the working directory
 ```
