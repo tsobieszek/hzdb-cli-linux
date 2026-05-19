@@ -28,7 +28,8 @@ Replace `YOUR_DEVICE_SERIAL` with the serial shown by `adb devices`. Place it on
 ## Installation
 
 ```sh
-make install   # downloads hzdb.exe, copies hzdb and hzdb.exe to ~/bin/, installs the Linux command reference as a Claude Code skill
-make download  # download hzdb.exe only
-make clean     # removes hzdb.exe from the working directory
+make install        # downloads hzdb.exe, copies hzdb and hzdb.exe to ~/bin/, installs the Linux command reference as a Claude Code skill
+make download       # download hzdb.exe only
+make check-version  # show the latest upstream version of hzdb.exe
+make clean          # removes hzdb.exe from the working directory
 ```
