@@ -1,0 +1,506 @@
+#!/bin/sh
+
+HZDB_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/hzdb/config"
+HZDB_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/hzdb"
+HZDB_TRACES="${HZDB_DATA}/traces"
+
+print_help() {
+    cat <<'EOF'
+Horizon Debug Bridge - CLI for Meta Quest device development
+
+Usage: hzdb [OPTIONS] [COMMAND]
+
+Commands:
+  adb          Low-level ADB-compatible commands (devices, shell, logcat, etc.)
+  app          Manage applications on the device (install, uninstall, launch, etc.)
+  audio        Device audio volume and mute control
+  capture      Capture screenshots and screen recordings from the device
+  config       Manage hzdb configuration settings
+  device       Manage connected Meta Quest devices (list, info, connect, battery, etc.)
+  docs         Search and fetch Meta Quest developer documentation
+  files        Manage files on the device (ls, push, pull, rm, mkdir)
+  log          View device logs (shortcut for `hzdb adb logcat`)
+  perf         Performance analysis and Perfetto trace tools
+  shell        Run a shell command on the device (shortcut for `hzdb adb shell`)
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -d, --device <DEVICE>  Target device ID (also reads HZDB_DEVICE env var)
+      --format <FORMAT>  Output format (table, json, plain) [default: table]
+      --json             Output in JSON format (shorthand for --format json)
+      --markdown-help    Print help in markdown format
+  -v, --verbose...       Increase logging verbosity
+  -q, --quiet...         Decrease logging verbosity
+  -h, --help             Print help
+  -V, --version          Print version
+
+EOF
+}
+
+wine_hzdb() {
+    wine ~/bin/hzdb.exe "$@" 2>&1 \
+        | grep --line-buffered -v '^pci id for fd\|^libEGL warning\|:fixme:' \
+        | sed -u '/[^[:space:]]/,$!d'
+}
+
+unsupported() {
+    echo "$0 $*: not supported on Linux" >&2
+    exit 1
+}
+
+config_ensure_dir() { mkdir -p "$(dirname "$HZDB_CONFIG")"; }
+
+config_get() { grep "^$1=" "$HZDB_CONFIG" 2>/dev/null | cut -d= -f2-; }
+
+config_set() {
+    config_ensure_dir
+    { grep -v "^$1=" "$HZDB_CONFIG" 2>/dev/null; echo "$1=$2"; } > "${HZDB_CONFIG}.tmp"
+    mv "${HZDB_CONFIG}.tmp" "$HZDB_CONFIG"
+}
+
+config_reset() {
+    config_ensure_dir
+    grep -v "^$1=" "$HZDB_CONFIG" 2>/dev/null > "${HZDB_CONFIG}.tmp"
+    mv "${HZDB_CONFIG}.tmp" "$HZDB_CONFIG"
+}
+
+app_launch_component() {
+    case "$1" in
+        */*) echo "$1" ;;
+        *) adbq $opts shell cmd package resolve-activity --brief "$1" | tail -1 ;;
+    esac
+}
+
+app_launch_wait_idle() {
+    elapsed=0
+    while [ "${elapsed}" -lt "$2" ]; do
+        adbq $opts shell dumpsys activity activities \
+            | grep -qE "mCurrentFocus.*$1|ResumedActivity.*$1" && return 0
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    echo "$0 app launch: timed out waiting for $1 to become focused" >&2
+    return 1
+}
+
+app_launch_verify_crashes() {
+    sleep "$2"
+    crashes=$(adbq $opts shell logcat -d -t 100 2>/dev/null \
+        | grep -E "FATAL EXCEPTION|ANR in|native crash" | grep "$1" || true)
+    if [ -n "${crashes}" ]; then echo "${crashes}" >&2; return 1; fi
+}
+
+opts=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            print_help; exit 0 ;;
+        --markdown-help)
+            wine_hzdb --markdown-help; exit $? ;;
+        -V|--version)
+            wine_hzdb -V; exit $? ;;
+        -d|--device)
+            opts="${opts:+$opts }$1 $2"; shift 2 ;;
+        --)
+            shift; break ;;
+        -*)
+            opts="${opts:+$opts }$1"; shift ;;
+        *)
+            break ;;
+    esac
+done
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "${cmd}" in
+    "")
+        print_help
+        ;;
+
+    help)
+        helpcmd="${1:-}"
+        [ $# -gt 0 ] && shift
+        case "${helpcmd}" in
+            adb|app|audio|capture|config|device|docs|files|log|perf|shell)
+                wine_hzdb $opts help "${helpcmd}" "$@" ;;
+            "")
+                print_help ;;
+            *)
+                echo "$0: unknown help topic: ${helpcmd}" >&2; exit 1 ;;
+        esac
+        ;;
+
+    docs)
+        wine_hzdb $opts docs "$@"
+        ;;
+
+    adb)
+        adbq $opts "$@"
+        ;;
+
+    log)
+        adbq $opts logcat "$@"
+        ;;
+
+    shell)
+        adbq $opts shell "$@"
+        ;;
+
+    app)
+        app_cmd="${1:-}"
+        [ $# -gt 0 ] && shift
+        case "${app_cmd}" in
+            install)
+                adbq $opts install -r "$@" ;;
+            uninstall)
+                adbq $opts uninstall "$@" ;;
+            list)
+                adbq $opts shell pm list packages "$@" ;;
+            launch)
+                cold_start=0 wait_for_idle=0 wait_timeout=15
+                measure_launch=0 verify=0 verify_window=3 target="" activity=""
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        --cold-start) cold_start=1; shift ;;
+                        --wait-for-idle) wait_for_idle=1; shift ;;
+                        --wait-timeout) wait_timeout="$2"; shift 2 ;;
+                        --measure-launch-time) measure_launch=1; shift ;;
+                        --verify) verify=1; shift ;;
+                        --verify-window) verify_window="$2"; shift 2 ;;
+                        -a|--activity) activity="$2"; shift 2 ;;
+                        *) target="$1"; shift ;;
+                    esac
+                done
+                pkg=$(echo "${target}" | cut -d/ -f1)
+                [ -n "${activity}" ] && target="${pkg}/${activity}"
+                component=$(app_launch_component "${target}")
+                [ "${cold_start}" = "1" ] && adbq $opts shell am force-stop "${pkg}"
+                launch_start=$(date +%s%3N)
+                adbq $opts shell am start -W -n "${component}"
+                [ "${wait_for_idle}" = "1" ] && app_launch_wait_idle "${pkg}" "${wait_timeout}"
+                [ "${measure_launch}" = "1" ] && echo "Launch time: $(( $(date +%s%3N) - launch_start ))ms"
+                if [ "${verify}" = "1" ]; then
+                    app_launch_verify_crashes "${pkg}" "${verify_window}" || exit 1
+                fi
+                ;;
+            stop)
+                adbq $opts shell am force-stop "$@" ;;
+            clear)
+                adbq $opts shell pm clear "$@" ;;
+            info)
+                adbq $opts shell dumpsys package "$@" ;;
+            path)
+                adbq $opts shell pm path "$@" ;;
+            foreground)
+                adbq $opts shell dumpsys activity activities | grep -E 'mCurrentFocus|ResumedActivity' ;;
+            *)
+                unsupported "app ${app_cmd}" ;;
+        esac
+        ;;
+
+    audio)
+        audio_cmd="${1:-}"
+        [ $# -gt 0 ] && shift
+        case "${audio_cmd}" in
+            status)
+                adbq $opts shell media volume --show --stream 3 ;;
+            set)
+                adbq $opts shell media volume --set "$1" --stream 3 ;;
+            mute)
+                mkdir -p "${HZDB_DATA}"
+                adbq $opts shell media volume --show --stream 3 \
+                    | grep -oE '[0-9]+' | head -1 > "${HZDB_DATA}/muted_vol"
+                adbq $opts shell media volume --set 0 --stream 3
+                ;;
+            unmute)
+                vol=$(cat "${HZDB_DATA}/muted_vol" 2>/dev/null)
+                if [ -z "${vol}" ]; then
+                    echo "$0 audio unmute: no saved volume found" >&2; exit 1
+                fi
+                adbq $opts shell media volume --set "${vol}" --stream 3
+                ;;
+            *)
+                unsupported "audio ${audio_cmd}" ;;
+        esac
+        ;;
+
+    capture)
+        cap_cmd="${1:-}"
+        [ $# -gt 0 ] && shift
+        case "${cap_cmd}" in
+            screenshot)
+                output="screenshot_$(date +%Y%m%d_%H%M%S).png"
+                remote="/sdcard/_hzdb_screenshot.png"
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        -o|--output) output="$2"; shift 2 ;;
+                        --width|--height|--method) shift 2 ;;
+                        *) shift ;;
+                    esac
+                done
+                adbq $opts shell screencap -p "${remote}"
+                adbq $opts pull "${remote}" "${output}"
+                adbq $opts shell rm "${remote}"
+                echo "Screenshot saved: ${output}"
+                ;;
+            *)
+                unsupported "capture ${cap_cmd}" ;;
+        esac
+        ;;
+
+    config)
+        config_cmd="${1:-}"
+        [ $# -gt 0 ] && shift
+        case "${config_cmd}" in
+            get)
+                val=$(config_get "$1")
+                if [ -z "${val}" ]; then
+                    echo "$0 config get: key not found: $1" >&2; exit 1
+                fi
+                echo "${val}"
+                ;;
+            set)
+                config_set "$1" "$2" ;;
+            reset)
+                config_reset "$1" ;;
+            list)
+                if [ -f "$HZDB_CONFIG" ]; then cat "$HZDB_CONFIG"
+                else echo "(no configuration set)"; fi
+                ;;
+            *)
+                unsupported "config ${config_cmd}" ;;
+        esac
+        ;;
+
+    device)
+        dev_cmd="${1:-}"
+        [ $# -gt 0 ] && shift
+        case "${dev_cmd}" in
+            list)
+                adbq $opts devices ;;
+            info)
+                adb -s "$1" shell getprop ;;
+            connect)
+                adbq $opts connect "$1" ;;
+            disconnect)
+                adbq $opts disconnect "$@" ;;
+            reboot)
+                adbq $opts reboot "$@" ;;
+            wake)
+                adbq $opts shell input keyevent KEYCODE_WAKEUP ;;
+            wait)
+                state="device"
+                timeout_secs=60
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        --state) state="$2"; shift 2 ;;
+                        --timeout-secs) timeout_secs="$2"; shift 2 ;;
+                        *) shift ;;
+                    esac
+                done
+                timeout "${timeout_secs}" adbq $opts "wait-for-${state}"
+                ;;
+            battery)
+                adbq $opts shell dumpsys battery ;;
+            controllers)
+                adbq $opts shell dumpsys input | grep -A10 'Quest\|Touch\|Controller' ;;
+            configure-testing)
+                ct_cmd="${1:-}"
+                [ $# -gt 0 ] && shift
+                case "${ct_cmd}" in
+                    setup)
+                        adbq $opts shell settings put global window_animation_scale 0.0
+                        adbq $opts shell settings put global transition_animation_scale 0.0
+                        adbq $opts shell settings put global animator_duration_scale 0.0
+                        adbq $opts shell settings put global stay_on_while_plugged_in 3
+                        echo "Device configured for testing"
+                        ;;
+                    restore)
+                        adbq $opts shell settings put global window_animation_scale 1.0
+                        adbq $opts shell settings put global transition_animation_scale 1.0
+                        adbq $opts shell settings put global animator_duration_scale 1.0
+                        adbq $opts shell settings put global stay_on_while_plugged_in 0
+                        echo "Device settings restored"
+                        ;;
+                    *)
+                        unsupported "device configure-testing ${ct_cmd}" ;;
+                esac
+                ;;
+            health-check)
+                bat=$(adbq $opts shell dumpsys battery | grep ' level:' | awk '{print $2}')
+                storage=$(adbq $opts shell df /data | awk 'NR==2 {print $5}')
+                model=$(adbq $opts shell getprop ro.product.model)
+                echo "Model:   ${model}"
+                echo "Battery: ${bat}%"
+                echo "Storage: ${storage} used"
+                ;;
+            proximity)
+                prox_enable=0 prox_disable=0 prox_status=0 duration_ms=""
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        -e|--enable) prox_enable=1; shift ;;
+                        --disable) prox_disable=1; shift ;;
+                        -s|--status) prox_status=1; shift ;;
+                        --duration-ms) duration_ms="$2"; shift 2 ;;
+                        *) shift ;;
+                    esac
+                done
+                if [ "${prox_status}" = "1" ]; then
+                    val=$(adbq $opts shell getprop debug.oculus.forceHeadsetOn)
+                    if [ "${val}" = "1" ]; then echo "Proximity sensor: disabled"
+                    else echo "Proximity sensor: enabled"; fi
+                elif [ "${prox_enable}" = "1" ]; then
+                    adbq $opts shell setprop debug.oculus.forceHeadsetOn 0
+                elif [ "${prox_disable}" = "1" ]; then
+                    adbq $opts shell setprop debug.oculus.forceHeadsetOn 1
+                    if [ -n "${duration_ms}" ]; then
+                        secs=$(( duration_ms / 1000 ))
+                        (sleep "${secs}" && adbq $opts shell setprop debug.oculus.forceHeadsetOn 0) &
+                    fi
+                else
+                    echo "$0 device proximity: specify --enable, --disable, or --status" >&2; exit 1
+                fi
+                ;;
+            *)
+                unsupported "device ${dev_cmd}" ;;
+        esac
+        ;;
+
+    files)
+        files_cmd="${1:-}"
+        [ $# -gt 0 ] && shift
+        case "${files_cmd}" in
+            ls)
+                ls_flags="" ls_path="/sdcard/"
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        -a|--all) ls_flags="${ls_flags:+$ls_flags }-a"; shift ;;
+                        *) ls_path="$1"; shift ;;
+                    esac
+                done
+                adbq $opts shell ls ${ls_flags} "${ls_path}"
+                ;;
+            pull)
+                adbq $opts pull "$@" ;;
+            push)
+                adbq $opts push "$@" ;;
+            rm)
+                rm_flags=""
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        -r|--recursive) rm_flags="-r"; shift ;;
+                        *) break ;;
+                    esac
+                done
+                adbq $opts shell rm ${rm_flags} "$@"
+                ;;
+            mkdir)
+                mkdir_flags="-p"
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        -p|--parents) mkdir_flags="-p"; shift ;;
+                        *) break ;;
+                    esac
+                done
+                adbq $opts shell mkdir ${mkdir_flags} "$@"
+                ;;
+            *)
+                unsupported "files ${files_cmd}" ;;
+        esac
+        ;;
+
+    perf)
+        perf_cmd="${1:-}"
+        [ $# -gt 0 ] && shift
+        case "${perf_cmd}" in
+            capture)
+                duration=5000
+                output="trace_$(date +%Y%m%d_%H%M%S)"
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        --duration) duration="$2"; shift 2 ;;
+                        -o|--output) output="$2"; shift 2 ;;
+                        -m|--mode|--app|-f|--format) shift 2 ;;
+                        --gpu-render-stage|--gpu-metrics|--cpu-scheduling|--xr-runtime|--vulkan-layer|--extended-scheduling) shift ;;
+                        *) shift ;;
+                    esac
+                done
+                remote="/data/misc/perfetto-traces/${output}.perfetto-trace"
+                mkdir -p "${HZDB_TRACES}"
+                adbq $opts shell "perfetto -o ${remote} -t ${duration}ms sched freq memory"
+                adbq $opts pull "${remote}" "${HZDB_TRACES}/${output}.perfetto-trace"
+                echo "Session ID: ${output}"
+                echo "Trace: ${HZDB_TRACES}/${output}.perfetto-trace"
+                ;;
+            start)
+                output="trace_$(date +%Y%m%d_%H%M%S)"
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        -o|--output) output="$2"; shift 2 ;;
+                        -m|--mode|--app) shift 2 ;;
+                        --gpu-render-stage|--gpu-metrics|--cpu-scheduling|--xr-runtime|--vulkan-layer|--extended-scheduling) shift ;;
+                        *) shift ;;
+                    esac
+                done
+                remote="/data/misc/perfetto-traces/${output}.perfetto-trace"
+                pid=$(adbq $opts shell "perfetto --background -o ${remote} sched freq memory")
+                echo "PID: ${pid}"
+                echo "Output: ${output}"
+                ;;
+            stop)
+                pid="${1:-}" output_name="${2:-}"
+                adbq $opts shell kill -SIGTERM "${pid}"
+                sleep 1
+                mkdir -p "${HZDB_TRACES}"
+                adbq $opts pull "/data/misc/perfetto-traces/${output_name}.perfetto-trace" \
+                    "${HZDB_TRACES}/${output_name}.perfetto-trace"
+                echo "Trace: ${HZDB_TRACES}/${output_name}.perfetto-trace"
+                ;;
+            traces)
+                limit=10
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        -l|--limit) limit="$2"; shift 2 ;;
+                        *) shift ;;
+                    esac
+                done
+                ls -lt "${HZDB_TRACES}"/*.perfetto-trace 2>/dev/null | head -"${limit}"
+                ;;
+            open)
+                trace="${HZDB_TRACES}/${1}.perfetto-trace"
+                if [ ! -f "${trace}" ]; then
+                    echo "$0 perf open: trace not found: ${trace}" >&2; exit 1
+                fi
+                xdg-open "${trace}"
+                ;;
+            hex-to-datetime)
+                python3 -c "
+import sys, datetime
+ts = int(sys.argv[1], 16)
+print(datetime.datetime.fromtimestamp(ts / 1e9).isoformat())
+" "$1"
+                ;;
+            context)
+                echo "Traces directory: ${HZDB_TRACES}"
+                if [ -n "${1:-}" ]; then
+                    ls -la "${HZDB_TRACES}/${1}"* 2>/dev/null
+                else
+                    ls -lt "${HZDB_TRACES}"/*.perfetto-trace 2>/dev/null | head -5
+                fi
+                ;;
+            load|query|analyze-trace|gpu-counters|thread-state|compare)
+                unsupported "perf ${perf_cmd}" ;;
+            *)
+                unsupported "perf ${perf_cmd}" ;;
+        esac
+        ;;
+
+    init|self-update)
+        unsupported "${cmd}"
+        ;;
+
+    *)
+        unsupported "${cmd}"
+        ;;
+esac
