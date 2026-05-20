@@ -46,6 +46,11 @@ Diff the new `hzdb-<new-version>.md` against the previous `hzdb-<old-version>.md
 3. The `help` passthrough list in `hzdb` (the `adb|app|audio|...` pattern in the `help)` case)
 4. The top-level `print_help()` function in `hzdb`
 
+## Testing notes
+
+- **CRITICAL**: `make download` is essential for testing. Without it, Wine/hzdb.exe is unavailable and the message "wine or hzdb.exe not available" appears, which is insufficient for validating changes. Always run `make download` before testing.
+- **CRITICAL**: Do NOT run under ai-jail. When constrained by ai-jail, the testing environment is too restricted to verify actual behavior. Always request to be outside ai-jail constraints before testing.
+
 ## Maintenance notes
 
 - When performing an upgrade or any significant change, record non-obvious discoveries and traps in this file so they don't have to be rediscovered.

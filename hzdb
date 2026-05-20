@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 HZDB_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/hzdb/config"
 HZDB_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/hzdb"
@@ -38,14 +38,43 @@ EOF
 }
 
 wine_hzdb() {
-    wine ~/bin/hzdb.exe "$@" 2>&1 \
-        | grep --line-buffered -v '^pci id for fd\|^libEGL warning\|:fixme:' \
-        | sed -u '/[^[:space:]]/,$!d'
+    ( set -o pipefail
+      wine ~/bin/hzdb.exe "$@" 2>&1 \
+          | grep --line-buffered -v '^pci id for fd\|^libEGL warning\|:fixme:\|^[0-9a-f]*:err:\|^wine:\|^wineserver:' \
+          | sed -u '/[^[:space:]]/,$!d'
+    )
 }
 
 unsupported() {
     echo "$0 $*: not supported on Linux" >&2
     exit 1
+}
+
+subcommand_help() {
+    local help_text
+    help_text=$(wine_hzdb help "$@" 2>/dev/null)
+    if [ -n "${help_text}" ]; then
+        echo "${help_text}"
+    else
+        cat <<EOF
+$*: no help available (wine or hzdb.exe not available)
+
+Try: $0 $* <subcommand>
+EOF
+    fi
+}
+
+maybe_unsupported() {
+    local cmd_path="$1"; shift
+    if [ $# -eq 0 ]; then
+        subcommand_help $cmd_path; return
+    fi
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help) subcommand_help $cmd_path; return ;;
+        esac
+    done
+    unsupported "${cmd_path}"
 }
 
 config_ensure_dir() { mkdir -p "$(dirname "$HZDB_CONFIG")"; }
@@ -151,6 +180,8 @@ case "${cmd}" in
         app_cmd="${1:-}"
         [ $# -gt 0 ] && shift
         case "${app_cmd}" in
+            ""|--help|-h|help)
+                subcommand_help app ;;
             install)
                 adbq $opts install -r "$@" ;;
             uninstall)
@@ -195,7 +226,7 @@ case "${cmd}" in
             foreground)
                 adbq $opts shell dumpsys activity activities | grep -E 'mCurrentFocus|ResumedActivity' ;;
             *)
-                unsupported "app ${app_cmd}" ;;
+                maybe_unsupported "app ${app_cmd}" "$@" ;;
         esac
         ;;
 
@@ -203,6 +234,8 @@ case "${cmd}" in
         audio_cmd="${1:-}"
         [ $# -gt 0 ] && shift
         case "${audio_cmd}" in
+            ""|--help|-h|help)
+                subcommand_help audio ;;
             status)
                 adbq $opts shell media volume --show --stream 3 ;;
             set)
@@ -221,7 +254,7 @@ case "${cmd}" in
                 adbq $opts shell media volume --set "${vol}" --stream 3
                 ;;
             *)
-                unsupported "audio ${audio_cmd}" ;;
+                maybe_unsupported "audio ${audio_cmd}" "$@" ;;
         esac
         ;;
 
@@ -229,6 +262,8 @@ case "${cmd}" in
         cap_cmd="${1:-}"
         [ $# -gt 0 ] && shift
         case "${cap_cmd}" in
+            ""|--help|-h|help)
+                subcommand_help capture ;;
             screenshot)
                 output="screenshot_$(date +%Y%m%d_%H%M%S).png"
                 remote="/sdcard/_hzdb_screenshot.png"
@@ -245,7 +280,7 @@ case "${cmd}" in
                 echo "Screenshot saved: ${output}"
                 ;;
             *)
-                unsupported "capture ${cap_cmd}" ;;
+                maybe_unsupported "capture ${cap_cmd}" "$@" ;;
         esac
         ;;
 
@@ -253,6 +288,8 @@ case "${cmd}" in
         config_cmd="${1:-}"
         [ $# -gt 0 ] && shift
         case "${config_cmd}" in
+            ""|--help|-h|help)
+                subcommand_help config ;;
             get)
                 val=$(config_get "$1")
                 if [ -z "${val}" ]; then
@@ -269,7 +306,7 @@ case "${cmd}" in
                 else echo "(no configuration set)"; fi
                 ;;
             *)
-                unsupported "config ${config_cmd}" ;;
+                maybe_unsupported "config ${config_cmd}" "$@" ;;
         esac
         ;;
 
@@ -277,6 +314,8 @@ case "${cmd}" in
         dev_cmd="${1:-}"
         [ $# -gt 0 ] && shift
         case "${dev_cmd}" in
+            ""|--help|-h|help)
+                subcommand_help device ;;
             list)
                 adbq $opts devices ;;
             info)
@@ -309,6 +348,8 @@ case "${cmd}" in
                 ct_cmd="${1:-}"
                 [ $# -gt 0 ] && shift
                 case "${ct_cmd}" in
+                    ""|--help|-h|help)
+                        subcommand_help device configure-testing ;;
                     setup)
                         adbq $opts shell settings put global window_animation_scale 0.0
                         adbq $opts shell settings put global transition_animation_scale 0.0
@@ -324,7 +365,7 @@ case "${cmd}" in
                         echo "Device settings restored"
                         ;;
                     *)
-                        unsupported "device configure-testing ${ct_cmd}" ;;
+                        maybe_unsupported "device configure-testing ${ct_cmd}" "$@" ;;
                 esac
                 ;;
             health-check)
@@ -363,7 +404,7 @@ case "${cmd}" in
                 fi
                 ;;
             *)
-                unsupported "device ${dev_cmd}" ;;
+                maybe_unsupported "device ${dev_cmd}" "$@" ;;
         esac
         ;;
 
@@ -371,6 +412,8 @@ case "${cmd}" in
         files_cmd="${1:-}"
         [ $# -gt 0 ] && shift
         case "${files_cmd}" in
+            ""|--help|-h|help)
+                subcommand_help files ;;
             ls)
                 ls_flags="" ls_path="/sdcard/"
                 while [ $# -gt 0 ]; do
@@ -406,7 +449,7 @@ case "${cmd}" in
                 adbq $opts shell mkdir ${mkdir_flags} "$@"
                 ;;
             *)
-                unsupported "files ${files_cmd}" ;;
+                maybe_unsupported "files ${files_cmd}" "$@" ;;
         esac
         ;;
 
@@ -414,6 +457,8 @@ case "${cmd}" in
         perf_cmd="${1:-}"
         [ $# -gt 0 ] && shift
         case "${perf_cmd}" in
+            ""|--help|-h|help)
+                subcommand_help perf ;;
             capture)
                 duration=5000
                 output="trace_$(date +%Y%m%d_%H%M%S)"
@@ -490,17 +535,17 @@ print(datetime.datetime.fromtimestamp(ts / 1e9).isoformat())
                 fi
                 ;;
             load|query|analyze-trace|gpu-counters|thread-state|compare)
-                unsupported "perf ${perf_cmd}" ;;
+                maybe_unsupported "perf ${perf_cmd}" "$@" ;;
             *)
-                unsupported "perf ${perf_cmd}" ;;
+                maybe_unsupported "perf ${perf_cmd}" "$@" ;;
         esac
         ;;
 
     init|self-update)
-        unsupported "${cmd}"
+        maybe_unsupported "${cmd}" "$@"
         ;;
 
     *)
-        unsupported "${cmd}"
+        echo "$0: unknown command: ${cmd}" >&2; exit 1
         ;;
 esac
